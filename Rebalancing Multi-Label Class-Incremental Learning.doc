@@ -1,0 +1,638 @@
+Motivation
+Multi-label class-incremental learning (MLCIL) is essential for real-world multi-label applications, allowing models to learn new labels while retaining previously learned knowledge continuously. However, recent MLCIL approaches can only achieve suboptimal performance due to the oversight of the positive-negative imbalance problem, which manifests at both the label and loss levels because of the task-level partial label issue.
+Class-incremental learning (CIL) (Buzzega et al. 2020; Douillard et al. 2020; Wang et al. 2024; Yang et al. 2023) continuously learn new classes without the need to retrain on the entire dataset. However, as the model learns new classes, it may overwrite the knowledge of previous tasks, resulting in a significant decline in performance on older classes, a phenomenon known as catastrophic forgetting (McCloskey and Cohen 1989). While numerous methods have been developed for single-label class-incremental learning (SLCIL) (Sun et al. 2022; Wang et al. 2022; Lyu et al. 2023, 2024), there has been limited exploration into the more practical domain of multi-label class-incremental learning (MLCIL) (Dong et al. 2023; Du et al. 2024b). In MLCIL, training images for new classes are partially labeled to minimize the cost of manual annotation. Specifically, only the classes for the new task are labeled, while the past and future ones are not annotated, a phenomenon called task-level partial label (PL) (Du et al. 2024b) or category-incomplete (Dong et al. 2023) issue. For example, as shown in Figure 1, there is a training image of Task 2 containing the labels “cat”, “person” and “dog”, only the labels for the current task (“person”) are annotated, while the labels for past (“cat”) and future (“dog”) tasks remain unannotated.
+However, most recent MLCIL methods focus on designing new network architectures for MLCIL to fit the PL setting, ignoring the positive-negative imbalance issue. AGCN (Du et al. 2022, 2024a) utilizes pseudo-labels to construct statistical label relationships within the Graph Convolutional Network (GCN). KRT (Dong et al. 2023) is the knowledge restoration and transfer framework based on a cross-attention mechanism (CAM). CSC (Du et al. 2024b) leverages a learnable GCN to calibrate label relationships. In fact, due to the larger number of negative labels compared to positive labels in multi-label samples (Ridnik et al. 2021a; Zhou et al. 2022; Xie et al. 2024), missing labels for both past and future tasks are prone to be labeled negative in MLCIL. A training example of task T is shown in Figure 1, it only lacks one positive label “person” (in red), while also missing many negative labels (“cat...car”) from other tasks. The substantial absence of negative labels (more than 9 times that of positive) results in a positive-negative imbalance at the label level. In some cases, the model may only learn the positive labels. Learning on such imbalance-labeled data poses the risk of collapsing to a trivial solution, i.e., the model tends to predict each label as positive (Zhou et al. 2022; Liu et al. 2023), thus leading to numerous false positive errors during loss optimization. This positive-negative imbalance manifests at the loss level due to the asymmetric contributions of the positive and negative loss parts to the optimization objectives.
+In this paper, we explore tackling the positive-negative imbalance issue in MLCIL from two key aspects: loss level and label level. The positive-negative imbalance arises at the loss level of recent MLCIL methods (Du et al. 2024a,b). Specifically, they utilize binary cross-entropy (BCE) loss and binary knowledge distillation (KD) loss for classification and mitigating forgetting. The loss imbalance during the optimization process fundamentally stems from the equal treatment of imbalanced positive and negative loss components by the BCE and KD losses. As a result, the contribution of positive labels to the loss is significantly greater than that of negative labels. This situation is suboptimal, as it leads to the accumulation of more loss gradients from positive labels due to the positive-negative imbalance (Ridnik et al. 2021a), resulting in insufficient learning of negative labels at the loss level. Due to the substantial absence of negative labels, the positive-negative imbalance also occurs at the label level. We aim to address this issue using a replay-based approach. In our further attempts to mitigate catastrophic forgetting, we observe that replay methods (Rolnick et al. 2019; Douillard et al. 2020; Buzzega et al. 2020), commonly used in single-label scenarios, exacerbate the label-level imbalance due to memory sampling of imbalance-labeled data. This exacerbation leads to an increase in false positive errors. Consequently, this label-level imbalance causes these methods to suboptimally address catastrophic forgetting.
+Innovation & Method
+To address the issues above, we first propose asymmetric knowledge distillation (AKD) for loss rebalance. AKD emphasizes the learning of negative labels in the classification loss for the current model and down-weights the contribution of overconfident old task predictions in the KD process. Then, we design the online relabeling (OR) strategy for label rebalance by continuously restoring the original class distribution in memory. Specifically, we relabel the missing old labels of the memory samples using the past model, while the missing new labels in memory are labeled with the trained current model. Rebalancing at both the Loss and Label levels, forming our RebLL framework. Our framework can mitigate the positive-negative imbalance and enhance MLCIL performance. Under the PL setting, our contributions are summarized below:• We are the first to identify the inherent positive-negative imbalance in MLCIL under the PL setting. This imbalance, occurring at both the loss and label levels, impedes the effective learning of MLCIL.• We propose a RebLL framework to suppress the positive-negative imbalance, consisting of AKD and OR components. AKD is designed for loss rebalance, while OR targets label rebalance. RebLL can effectively mitigate forgetting and enhance MLCIL performance by suppressing the positive-negative imbalance.• Extensive experiments conducted across multiple MLCIL scenarios using the PASCAL VOC and MS-COCO demonstrate that RebLL achieves new SOTA results, regardless of whether we use a vanilla CNN or a more powerful network architecture as the backbone.
+Preliminary
+MLCIL. Following previous works (Du et al. 2024a; Dong et al. 2023; Du et al. 2024b), given T multi-label learning tasks, and the corresponding training sets for these tasks are denoted as 
+{D 
+tm
+1
+​
+ ,⋯,D 
+tm
+T
+​
+ }
+ , and the testing sets are represented as 
+{D 
+tst
+1
+​
+ ,⋯,D 
+tst
+T
+​
+ }
+ . For each incremental state t the training dataset is defined as 
+D 
+trn
+t
+​
+ 
+ . 
+C 
+t
+ 
+ denotes the current task-specific class set, while the past class collection is denoted by 
+C 
+1:t−1
+ =∪ 
+i=1
+t−1
+​
+ C 
+i
+ 
+ . Moreover, 
+C 
+1:t
+ =C 
+1:t−1
+ ∪C 
+t
+ 
+ , and it holds that 
+ø
+ . The goal of MLCIL is for the model to recognize all previously learned labels in a multi-label image after sequentially training task-specific labels. Hence, for the t -th task, the training label space 
+y 
+trn
+t
+​
+ =C 
+t
+ 
+ , the testing label space 
+Y 
+tst
+t
+​
+ =C 
+1:t
+ 
+ .
+As shown in Figure 2 (a), similar to distillation-based MLCIL methods (Du et al. 2024a; Dong et al. 2023; Du et al. 2024b), we maintain a fixed old model 
+f 
+θ
+T−1
+​
+ 
+ and a trainable new model 
+f 
+θ
+T
+​
+ 
+ . In MLCIL, the inherent positive-negative imbalance manifests at loss and label levels. To address this issue, we propose the RebLL framework, which includes asymmetric knowledge distillation (AKD) for loss rebalance and online relabeling (OR) for label rebalance.
+Imbalance in Loss. Recent MLCIL (Du et al. 2024a,b) methods utilize BCE and KD for classification and mitigating forgetting. The BCE loss decouples the multi-label classification tasks into multiple binary issues, formulated as:
+L 
+bce
+​
+ =∑ 
+c∈C 
+t
+ 
+​
+ −y 
+c
+t
+​
+ log( 
+y
+^
+​
+  
+c
+t
+​
+ )−(1−y 
+c
+t
+​
+ )log(1− 
+y
+^
+​
+  
+c
+t
+​
+ ),(1)
+where 
+y
+^
+​
+  
+c
+t
+​
+ 
+ and 
+y 
+c
+t
+​
+ 
+ represents the predictions and ground-truth for class c and task t . KD loss uses the last task prediction 
+y
+^
+​
+  
+c
+t−1
+​
+ 
+ as supervisory information to guide the learning of current task to suppress catastrophic forgetting, formulated as:
+L 
+kd
+​
+ =∑ 
+c∈C 
+1:t−1
+ 
+​
+ − 
+y
+^
+​
+  
+c
+t−1
+​
+ log( 
+y
+^
+​
+  
+c
+t
+​
+ )−(1− 
+y
+^
+​
+  
+c
+t−1
+​
+ )log(1− 
+y
+^
+​
+  
+c
+t
+​
+ ).(2)
+To clarify how positive and negative labels are operated in 
+L 
+bce
+​
+ 
+ , a general form of Eq. (1) can be given by: 
+L 
+bce
+​
+ =∑−y 
+c
+t
+​
+ L 
++
+​
+ −(1−y 
+c
+t
+​
+ )L 
+−
+​
+ 
+ , 
+L 
++
+​
+ 
+ and 
+L 
+−
+​
+ 
+ can be regarded positive and negative loss parts, 
+L 
+kd
+​
+ 
+ follows the same format. Both 
+L 
+bce
+​
+ 
+ and 
+L 
+kd
+​
+ 
+ treat positive and negative loss parts equivalently, making it unsuitable for MLCIL where negative labels are insufficiently learned using the imbalance-labeled data. This approach is suboptimal because it results in the accumulation of excessive loss gradients from positive samples under positive-negative imbalance (Ridnik et al. 2021a). At the loss level, as there is an asymmetric learning of positive and negative labels in MLCIL, the contribution of the negative loss part should be emphasized, while the positive loss part should be down-weighted.
+Imbalance in Label. As shown in Figure 2 (a), given a multi-label image, its ground truth labels include a positive label “dog” and a negative label “motorcycle”. In the PL setting, it is missing a positive label “person”, while it lacks numerous negative labels, such as “cat...car”. This asymmetric missing of positive and negative labels leads to a label-level imbalance in MLCIL. We aim to address this issue using a replay-based approach. Figure 3 illustrates that many future and past labels are missing in the memory data sampled by the classical replay method in SLCIL. This exacerbates the imbalance in label during subsequent replay. When applying the classical replay method with AKD, the false positive rate (FPR) increased from 2.7% to 6.7%.
+AKD for Loss Rebalance
+To rebalance the positive-negative at the loss level, we propose asymmetric knowledge distillation (AKD), which down-weights the contribution of overconfident predictions while emphasizing the learning of negative labels. AKD consists of two components, 
+L 
+cls
+​
+ 
+ and 
+L 
+akd
+​
+ 
+ , which are enhancements of the BCE loss 
+L 
+bce
+​
+ 
+ and KD loss 
+L 
+kd
+​
+ 
+ .
+Firstly, we modify 
+L 
+bce
+​
+ 
+ in Eq. (1) to 
+L 
+cls
+​
+ 
+ . We emphasize the learning of negative samples by down-weighting the positive ones in the classification loss for the current model:
+L 
+cls
+​
+ =∑ 
+c∈C 
+t
+ 
+​
+ −y 
+c
+t
+​
+ L 
++
+​
+ −(1−y 
+c
+t
+​
+ )log(1− 
+y
+^
+​
+  
+c
+t
+​
+ ).(3)
+Inspired by focal loss (Lin et al. 2017), 
+L 
++
+​
+ 
+ is formulated as:
+L 
++
+​
+ =(1− 
+y
+^
+​
+  
+c
+t
+​
+ ) 
+αlog∣C 
+1:t
+ ∣
+ log( 
+y
+^
+​
+  
+c
+t
+​
+ ),c∈C 
+t
+ ,α>0,(4)
+where 
+L 
++
+​
+ 
+ is the positive loss part, α log 
+∣C 
+1:t
+ ∣
+ is an adaptive exponential decay factor related to the class number 
+∣C 
+1:t
+ ∣
+ and α is a hyperparameter. As the number of learned classes increases, the absence of negative labels becomes more severe, exacerbating the positive-negative imbalance and leading to more false positive errors. The exponential decay factor adaptively controls the intensity of down-weighting, with 
+log(⋅)
+ smoothing parameter adjustments.
+We then design 
+L 
+akd
+​
+ 
+ based on 
+L 
+kd
+​
+ 
+ to down-weight the contribution of overconfident old task predictions:
+L 
+akd
+​
+ =∑ 
+c∈C 
+1:t−1
+ 
+​
+ − 
+y
+^
+​
+  
+c
+t−1
+​
+ L 
++
+′
+​
+ −(1− 
+y
+^
+​
+  
+c
+t−1
+​
+ )log(1− 
+y
+^
+​
+  
+c
+t
+​
+ ),(5)
+L 
++
+′
+​
+ =(1− 
+y
+^
+​
+  
+c
+t
+​
+ ) 
+αlog∣C 
+1:t
+ ∣
+ log( 
+y
+^
+​
+  
+c
+t
+​
+ ),c∈C 
+1:t−1
+ ,α>0.(6)
+From a qualitative perspective, when a training image in Figure 2 (a) contains only “person” and “dog” labels, the classical KD method may output high prediction scores for non-existent labels like “car” and “cat”. AKD can reduce such false positive errors by down-weighting overconfident predictions, thereby rebalancing in loss. Figure 2 (b) presents a quantitative comparison: 1) it shows the prediction score statistics of KD, CSC (Du et al. 2024b) and AKD. Due to the imbalance, KD and CSC produce numerous erroneous and overconfident predictions. Compared to the baseline KD, our method significantly reduces the FPR from 31.9% to 2.7%. Additionally, in comparison to the SOTA method CSC, our approach also demonstrates significant superiority in FPR (2.7% vs 19.4%); 2) AKD also significantly improves the performance on mAP, CF1, and OF1 metrics, indirectly indicating that our method can more effectively mitigate catastrophic forgetting than the baseline KD.
+OR for Label Rebalance
+To mitigate the imbalance at the label level, we propose an approach based on reservoir sampling strategy (Rolnick et al. 2019) called online relabeling (OR). This method completes the labels of memory samples using both past and current models in an online manner. OR consists of two steps:
+First, after completing training for task t, we utilize the trained current model 
+f 
+θ
+t
+​
+ 
+ to relabel new classes 
+c 
+t
+ 
+ for the memory data sampled from old task 
+1:t−1
+ . Simultaneously, we employ the past model 
+f 
+θ
+t−1
+​
+ 
+ to relabel old classes 
+C 
+1:t−1
+ 
+ for the memory data sampled from the current task t. For instance, as shown in Figure 3, after completing training for task 3, we use 
+f 
+θ
+3
+​
+ 
+ to relabel the missing new classes 
+c 
+3
+ 
+ (in blue) for the memory data from tasks 1 : 2. Next, we apply 
+f 
+θ
+2
+​
+ 
+ to relabel the missing old classes 
+C 
+1:2
+ 
+ (in green) for task 3 memory samples. This label augmentation process continues until all tasks are trained, ensuring that all labels in memory are fully annotated online. We relabel the missing labels as positive or negative by setting a threshold n . A memory sample 
+x 
+′
+ 
+ is input into the comparatively reliable model ( 
+f 
+θ
+t−1
+​
+ 
+ or 
+f 
+θ
+t
+​
+ 
+ ) used for relabeling. If the model outputs a probability bigger than n for class i , the i-th label is set to 1 (positive); otherwise, it is set to 0 (negative), formulated as 
+y 
+i
+′
+​
+ =I( 
+y
+^
+​
+  
+i
+′
+​
+ >n)
+ , where is the indicator function that returns 1 if the condition inside is true and 0 otherwise.
+In the second step, when training task t, after relabeling in the first step, all memory samples are fully annotated. We then sample 
+(x 
+′
+ ,y 
+′
+ )
+ randomly from the memory buffer. Given that the first step introduces many negative labels, we use a loss function similar to 
+L 
+cls
+​
+ 
+ to down-weight these negative labels, rather than using 
+L 
+bce
+​
+ 
+ . The loss function is formulated as:
+L 
+er
+​
+ =∑ 
+c∈C 
+1:t−1
+ 
+​
+ −y 
+c
+′
+​
+ log( 
+y
+^
+​
+  
+c
+′
+​
+ )−(1−y 
+c
+′
+​
+ )L 
+−
+​
+ ,(7)
+L 
+−
+​
+ =( 
+y
+^
+​
+  
+c
+′
+​
+ ) 
+βlog∣C 
+1:t
+ ∣
+ log(1− 
+y
+^
+​
+  
+c
+′
+​
+ ),c∈C 
+1:t−1
+ ,β>0,(8)
+where 
+βlog∣C 
+1:t
+ ∣
+ represents the adaptive exponential decay factor, ensuring balanced learning of positive and negative labels. OR completes the label matrix in memory, reducing the FPR from 6.7% to 2.4%, mitigating label-level imbalance and catastrophic forgetting.
+Final Loss
+The final loss of RebLL is formulated as follows:
+L=λ 
+akd
+​
+ L 
+cls
+​
+ +(1−λ 
+akd
+​
+ )L 
+akd
+​
+ +λ 
+er
+​
+ L 
+er
+​
+ ,(9)
+where balancing parameters 
+λ 
+akd
+​
+ 
+ and 
+λ 
+er
+​
+ 
+ control the strength of distillation loss 
+L 
+akd
+​
+ 
+ and replay loss 
+L 
+er
+​
+ 
+ .
+
+CUDA_VISIBLE_DEVICES=0 nohup python main.py \
+  --model ResNet_101_MixAwareLoss \
+  -bs 16 \
+  -dr /export/data \
+  -ds VOC2007 \
+  -eps 40 60 \
+  --epochs 80 \
+  --lr 0.01 \
+  -lrp 0.1 \
+  -wup 2 \
+  -mixer SpliceMix \
+  -grids 1x2 2x2 \
+  -n_grids 2 2 \
+  -Sprob 1.0 \
+  -e 1 \
+  -ver 1 \
+  --remark "_MixAwareLossV2" \
+  -cd 0 \
+  -P 17865 \
+  > logs/mixaware_v2_train.log 2>&1 &
