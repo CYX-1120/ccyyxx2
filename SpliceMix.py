@@ -9,8 +9,9 @@ import torch.nn.functional as F
 import torchvision.utils
 
 
+
 class SpliceMix(object):
-    def __init__(self, mode='SpliceMix', grids=('2x2',), n_grids=(0,), mix_prob=1.):
+    def __init__(self, mode='SpliceMix', grids=('2x2',), n_grids=(0,), mix_prob=1., class_freq=None):
         # mode: 'SpliceMix' for custom grid setting; 'SpliceMix--Default=True' for default setting; 'SpliceMix--Mini=True' for minimalism setting
         # grids: grid settings, e.g., ['1x2', '2x2', '2x3-3']
         # n_grids: number of mixed samples in each setting, e.g., [3, 2, 1]
@@ -25,6 +26,7 @@ class SpliceMix(object):
         self.mix_prob = mix_prob
         self.grids = grids
         self.n_grids = n_grids
+        self.class_freq = class_freq
         self.use_asym = True
         self.config_default = {'1x2': .7, '2x2': .3, '2x3': .0, 'drop_rate': .3}
 
@@ -896,7 +898,7 @@ class SpliceMix(object):
 
 
 
-    def mix_fn_cam_guided(self, inputs, targets, g_row, g_col, n_grid, sal_map=None, n_drop=0):
+    def mix_fn_cam_guided(self, inputs, targets, g_row, g_col, n_grid, sal_map=None, n_drop=0, cam_map=None):
         """
         CAM 引导的混合函数
         
@@ -918,6 +920,8 @@ class SpliceMix(object):
         # 初始化 CAM mixer
         if self.cam_mixer is None:
             self.cam_mixer = CAMGuidedMixerV2()
+            if hasattr(self, "class_freq"):
+                self.cam_mixer.set_class_freq(self.class_freq)
         
         # 存储混合结果
         inputs_mix_list = []
@@ -930,11 +934,12 @@ class SpliceMix(object):
             group_inputs = inputs[start_idx:end_idx]
             group_sal = sal_map[start_idx:end_idx]
             group_targets = targets[start_idx:end_idx]
+            group_cam = cam_map[start_idx:end_idx] if cam_map is not None else None
             
             # V2: 使用 targets_group 而不是 sal_map
             mixed, mix_info = self.cam_mixer.apply_cam_guided_mix(
                 group_inputs, group_targets, g_row, g_col,
-                self.current_epoch, self.total_epochs, cam=None
+                self.current_epoch, self.total_epochs, cam=group_cam
             )
             
             inputs_mix_list.append(mixed)
@@ -1098,6 +1103,7 @@ class CAMGuidedMixerV2:
         self.classifier_weights = None
         self.num_classes = 20
         self.feat_dim = 2048
+        self.class_freq = None
         self.cam_smooth_kernel = 5
         self.cam_normalize = True
         self.conf_threshold = 0.4
@@ -1125,6 +1131,15 @@ class CAMGuidedMixerV2:
         self.log_enabled = True
         self.stats_window = []
         self.stats_window_size = 100
+        # Rare-aware & confidence-driven scheduling
+        self.rare_aware_enable = True
+        self.rare_weight_cap = 2.5
+        self.rare_threshold_scale = 0.15
+        self.rare_occlusion_scale = 0.6
+        self.density_confidence_enable = True
+        self.density_ref = 0.2
+        self.density_strength_min = 0.6
+        self.density_strength_max = 1.2
 
     def set_classifier_weights(self, model):
         try:
@@ -1138,6 +1153,16 @@ class CAMGuidedMixerV2:
         except Exception as e:
             print(f"[CAM-V2] Failed to load classifier weights: {e}")
         return False
+
+    def set_class_freq(self, class_freq):
+        if class_freq is None:
+            return
+        try:
+            freq = np.asarray(class_freq, dtype=np.float32)
+            if freq.ndim == 1 and freq.size > 0:
+                self.class_freq = freq
+        except Exception:
+            self.class_freq = None
 
     def compute_lightweight_cam(self, inputs):
         B, C, H, W = inputs.shape
@@ -1162,6 +1187,23 @@ class CAMGuidedMixerV2:
         B, H, W = cam.shape
         grid_cam = F.adaptive_avg_pool2d(cam.unsqueeze(1), (g_row, g_col)).squeeze(1)
         return grid_cam
+
+    def aggregate_multilabel_cam(self, cam, targets_group):
+        """
+        Aggregate class-wise CAM into a single map per image using label weights.
+
+        Args:
+            cam: Tensor [N, C, H, W] class-wise CAM.
+            targets_group: Tensor [N, C] multi-label targets (0/1 or probabilities).
+        """
+        weights = targets_group.float()
+        denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = weights / denom
+        cam = (cam * weights[:, :, None, None]).sum(dim=1)
+        cam_min = cam.view(cam.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
+        cam_max = cam.view(cam.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-6)
+        return cam
 
     def check_class_consistency(self, anchor_targets, donor_targets):
         if not self.class_consistency_enable:
@@ -1213,7 +1255,13 @@ class CAMGuidedMixerV2:
         h_step, w_step = H // g_row, W // g_col
         cam_strength, occlusion_prob = self.get_schedule_values(current_epoch, total_epochs)
         stats = {"keep_anchor": 0, "use_donor": 0, "occlude": 0, "cam_guided": 0, "fallback": 0, "total_grids": g}
-        if cam is None: cam = self.compute_lightweight_cam(inputs_group)
+        if cam is None:
+            cam = self.compute_lightweight_cam(inputs_group)
+        else:
+            if cam.dim() == 4 and cam.shape[1] == targets_group.shape[1]:
+                cam = self.aggregate_multilabel_cam(cam, targets_group)
+            elif cam.dim() != 3:
+                cam = self.compute_lightweight_cam(inputs_group)
         grid_cam = self.compute_grid_cam(cam, g_row, g_col)
         anchor_grid_cam = grid_cam[0]
         cam_valid, cam_reason = self.check_cam_quality(anchor_grid_cam)
@@ -1224,17 +1272,35 @@ class CAMGuidedMixerV2:
         self.update_ema_thresholds(anchor_grid_cam)
         high_thresh, low_thresh = self.ema_high_threshold, self.ema_low_threshold
         anchor_targets = targets_group[0]
+        if self.density_confidence_enable:
+            label_density = anchor_targets.mean().item()
+            conf = min(1.0, label_density / max(self.density_ref, 1e-6))
+            strength_scale = self.density_strength_min + (self.density_strength_max - self.density_strength_min) * conf
+            cam_strength = min(1.0, max(0.0, cam_strength * strength_scale))
+            occlusion_prob = occlusion_prob * conf
         donor_targets = targets_group[1:] if n_images > 1 else None
         valid_donors = self.check_class_consistency(anchor_targets, donor_targets) if donor_targets is not None else []
         mixed = torch.zeros((C, H, W), device=device, dtype=inputs_group.dtype)
+        rare_scale = 1.0
+        rare_occlusion_scale = 1.0
+        if self.rare_aware_enable and self.class_freq is not None:
+            pos_idx = (anchor_targets > 0).nonzero(as_tuple=False).view(-1)
+            if pos_idx.numel() > 0:
+                freq = torch.as_tensor(self.class_freq, device=anchor_targets.device, dtype=anchor_targets.dtype)
+                inv_freq = 1.0 / (freq + 1.0)
+                inv_freq = torch.clamp(inv_freq, max=self.rare_weight_cap)
+                rare_score = inv_freq[pos_idx].mean().item()
+                rare_scale = max(0.7, 1.0 - self.rare_threshold_scale * rare_score)
+                rare_occlusion_scale = max(0.3, 1.0 - self.rare_occlusion_scale * rare_score)
+                occlusion_prob = occlusion_prob * rare_occlusion_scale
         for i in range(g_row):
             for j in range(g_col):
                 grid_idx = i * g_col + j
                 h_start, h_end = i * h_step, (i + 1) * h_step
                 w_start, w_end = j * w_step, (j + 1) * w_step
                 anchor_cam_val = anchor_grid_cam[i, j].item()
-                effective_high = high_thresh * cam_strength + (1 - cam_strength) * 0.5
-                effective_low = low_thresh * cam_strength + (1 - cam_strength) * 0.5
+                effective_high = (high_thresh * cam_strength + (1 - cam_strength) * 0.5) * rare_scale
+                effective_low = (low_thresh * cam_strength + (1 - cam_strength) * 0.5) * rare_scale
                 if anchor_cam_val > effective_high:
                     if self.occlusion_enable and random.random() < occlusion_prob:
                         mixed[:, h_start:h_end, w_start:w_end] = self.occlusion_value
@@ -1278,4 +1344,3 @@ class CAMGuidedMixerV2:
 
 CAMGuidedMixer = CAMGuidedMixerV2
 _cam_guided_mixer = CAMGuidedMixerV2()
-
