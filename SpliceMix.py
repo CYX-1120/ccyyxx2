@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torchvision.utils
 
 
+
 class SpliceMix(object):
     def __init__(self, mode='SpliceMix', grids=('2x2',), n_grids=(0,), mix_prob=1., class_freq=None):
         # mode: 'SpliceMix' for custom grid setting; 'SpliceMix--Default=True' for default setting; 'SpliceMix--Mini=True' for minimalism setting
