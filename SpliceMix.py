@@ -10,7 +10,7 @@ import torchvision.utils
 
 
 class SpliceMix(object):
-    def __init__(self, mode='SpliceMix', grids=('2x2',), n_grids=(0,), mix_prob=1.):
+    def __init__(self, mode='SpliceMix', grids=('2x2',), n_grids=(0,), mix_prob=1., class_freq=None):
         # mode: 'SpliceMix' for custom grid setting; 'SpliceMix--Default=True' for default setting; 'SpliceMix--Mini=True' for minimalism setting
         # grids: grid settings, e.g., ['1x2', '2x2', '2x3-3']
         # n_grids: number of mixed samples in each setting, e.g., [3, 2, 1]
@@ -25,6 +25,7 @@ class SpliceMix(object):
         self.mix_prob = mix_prob
         self.grids = grids
         self.n_grids = n_grids
+        self.class_freq = class_freq
         self.use_asym = True
         self.config_default = {'1x2': .7, '2x2': .3, '2x3': .0, 'drop_rate': .3}
 
